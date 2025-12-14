@@ -1,306 +1,396 @@
-from __future__ import annotations
-
 import argparse
 import base64
-import getpass
-import json
-import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Tuple
 
 import requests
 
-from crypto_utils import (
-    decrypt_aes_gcm,
-    encrypt_aes_gcm,
-    generate_rsa_keypair,
-    load_private_key,
-    load_public_key,
-    rsa_decrypt_key,
-    rsa_encrypt_key,
-    rsa_sign,
-    rsa_verify,
-    stable_signing_payload,
-    store_private_key,
-    store_public_key,
-)
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+
+# ===== Crypto helpers =====
+
+def generate_rsa_keypair() -> Tuple[bytes, bytes]:
+    """Generate an RSA 2048 key pair and return (private_pem, public_pem)."""
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return private_pem, public_pem
 
 
-DEFAULT_SERVER = os.environ.get('SECURETALK_SERVER', 'http://127.0.0.1:5000')
-DATA_DIR = Path(os.environ.get('SECURETALK_HOME', str(Path.home() / '.securetalk')))
-
-
-def _b64(b: bytes) -> str:
-    return base64.b64encode(b).decode('ascii')
-
-
-def _unb64(s: str) -> bytes:
-    return base64.b64decode(s.encode('ascii'))
-
-
-def user_dir(username: str) -> Path:
-    return DATA_DIR / username
-
-
-def token_path(username: str) -> Path:
-    return user_dir(username) / 'token.json'
-
-
-def save_token(username: str, token: str) -> None:
-    ud = user_dir(username)
-    ud.mkdir(parents=True, exist_ok=True)
-    token_path(username).write_text(json.dumps({'token': token}))
-
-
-def load_token(username: str) -> str:
-    p = token_path(username)
-    if not p.exists():
-        raise SystemExit(f"No token found for '{username}'. Run: client.py login {username}")
-    return json.loads(p.read_text())['token']
-
-
-def headers_with_token(token: str) -> Dict[str, str]:
-    return {'Authorization': f'Bearer {token}'}
-
-
-def key_paths(username: str) -> Dict[str, Path]:
-    ud = user_dir(username)
-    return {
-        'private': ud / 'private_key.pem',
-        'public': ud / 'public_key.pem',
-    }
-
-
-def ensure_keys(username: str, passphrase: str) -> Dict[str, str]:
-    kp = key_paths(username)
-    if kp['private'].exists() and kp['public'].exists():
-        return {
-            'private_pem': kp['private'].read_text(),
-            'public_pem': kp['public'].read_text(),
-        }
-
-    private, public = generate_rsa_keypair(key_size=3072)
-    store_private_key(private, kp['private'], passphrase)
-    store_public_key(public, kp['public'])
-    return {
-        'private_pem': kp['private'].read_text(),
-        'public_pem': kp['public'].read_text(),
-    }
-
-
-def cmd_register(args: argparse.Namespace) -> None:
-    username = args.username
-    server = args.server
-
-    password = getpass.getpass('Choose account password (server-side auth): ')
-    key_pass = getpass.getpass('Choose key passphrase (encrypts your private key locally): ')
-    ensure_keys(username, key_pass)
-
-    public_pem = (user_dir(username) / 'public_key.pem').read_text()
-
-    r = requests.post(f'{server}/register', json={
-        'username': username,
-        'password': password,
-        'public_key_pem': public_pem,
-    }, timeout=30)
-    if r.status_code != 200:
-        raise SystemExit(f'Register failed: {r.status_code} {r.text}')
-
-    print(r.json()['message'])
-
-
-def cmd_login(args: argparse.Namespace) -> None:
-    server = args.server
-    username = args.username
-    password = getpass.getpass('Password: ')
-
-    r = requests.post(f'{server}/login', json={'username': username, 'password': password}, timeout=30)
-    if r.status_code != 200:
-        raise SystemExit(f'Login failed: {r.status_code} {r.text}')
-
-    token = r.json()['token']
-    save_token(username, token)
-    print('Logged in. Token saved locally.')
-
-
-def cmd_send(args: argparse.Namespace) -> None:
-    server = args.server
-    sender = args.sender
-    recipient = args.to
-    token = load_token(sender)
-
-    key_pass = getpass.getpass('Key passphrase (to use your private key for optional signing): ')
-
-    # Load sender private (for signing) + fetch recipient public (for wrapping)
-    sender_priv = load_private_key(key_paths(sender)['private'], key_pass)
-
-    r_pub = requests.get(f'{server}/public_key/{recipient}', headers=headers_with_token(token), timeout=30)
-    if r_pub.status_code != 200:
-        raise SystemExit(f'Failed to get recipient public key: {r_pub.status_code} {r_pub.text}')
-    recipient_pub = load_public_key(r_pub.json()['public_key_pem'].encode('utf-8'))
-
-    # Content
-    is_file = args.file is not None
-    if is_file:
-        file_path = Path(args.file)
-        plaintext = file_path.read_bytes()
-        filename = file_path.name
-    else:
-        plaintext = args.message.encode('utf-8')
-        filename = None
-
-    # Encrypt content with fresh AES key
-    ct = encrypt_aes_gcm(plaintext)
-
-    # Wrap AES key to recipient
-    wrapped_key = rsa_encrypt_key(recipient_pub, ct.key)
-
-    # Optional signature
-    signature = None
-    if args.sign:
-        payload = stable_signing_payload(
-            sender.encode('utf-8'),
-            recipient.encode('utf-8'),
-            b'file' if is_file else b'message',
-            wrapped_key,
-            ct.nonce,
-            ct.ciphertext,
-            ct.tag,
-            (filename or '').encode('utf-8'),
-        )
-        signature = rsa_sign(sender_priv, payload)
-
-    body: Dict[str, Any] = {
-        'recipient': recipient,
-        'kind': 'file' if is_file else 'message',
-        'wrapped_key_b64': _b64(wrapped_key),
-        'nonce_b64': _b64(ct.nonce),
-        'ciphertext_b64': _b64(ct.ciphertext),
-        'tag_b64': _b64(ct.tag),
-        'filename': filename,
-        'signature_b64': _b64(signature) if signature else None,
-    }
-
-    r = requests.post(f'{server}/send', json=body, headers=headers_with_token(token), timeout=60)
-    if r.status_code != 200:
-        raise SystemExit(f'Send failed: {r.status_code} {r.text}')
-
-    print(f"Sent. Message id: {r.json()['id']}")
-
-
-def cmd_inbox(args: argparse.Namespace) -> None:
-    server = args.server
-    username = args.username
-    token = load_token(username)
-
-    r = requests.get(f'{server}/inbox', headers=headers_with_token(token), timeout=30)
-    if r.status_code != 200:
-        raise SystemExit(f'Inbox failed: {r.status_code} {r.text}')
-
-    items = r.json()['items']
-    if not items:
-        print('Inbox empty.')
-        return
-
-    for it in items:
-        print(f"[{it['id']}] from={it['sender']} kind={it['kind']} filename={it.get('filename') or ''} at={it['created_at']}")
-
-
-def cmd_read(args: argparse.Namespace) -> None:
-    server = args.server
-    username = args.username
-    token = load_token(username)
-
-    key_pass = getpass.getpass('Key passphrase: ')
-    priv = load_private_key(key_paths(username)['private'], key_pass)
-
-    r = requests.get(f'{server}/item/{args.id}', headers=headers_with_token(token), timeout=30)
-    if r.status_code != 200:
-        raise SystemExit(f'Read failed: {r.status_code} {r.text}')
-
-    it = r.json()['item']
-
-    # decrypt AES key
-    aes_key = rsa_decrypt_key(priv, _unb64(it['wrapped_key_b64']))
-
-    # decrypt content
-    plaintext = decrypt_aes_gcm(
-        key=aes_key,
-        nonce=_unb64(it['nonce_b64']),
-        ciphertext=_unb64(it['ciphertext_b64']),
-        tag=_unb64(it['tag_b64']),
+def load_private_key(pem_bytes: bytes):
+    return serialization.load_pem_private_key(
+        pem_bytes,
+        password=None,
+        backend=default_backend()
     )
 
-    # verify signature if present
-    if it.get('signature_b64'):
-        r_spk = requests.get(f"{server}/public_key/{it['sender']}", headers=headers_with_token(token), timeout=30)
-        if r_spk.status_code == 200:
-            sender_pub = load_public_key(r_spk.json()['public_key_pem'].encode('utf-8'))
-            payload = stable_signing_payload(
-                it['sender'].encode('utf-8'),
-                it['recipient'].encode('utf-8'),
-                it['kind'].encode('utf-8'),
-                _unb64(it['wrapped_key_b64']),
-                _unb64(it['nonce_b64']),
-                _unb64(it['ciphertext_b64']),
-                _unb64(it['tag_b64']),
-                (it.get('filename') or '').encode('utf-8'),
-            )
-            ok = rsa_verify(sender_pub, payload, _unb64(it['signature_b64']))
-            print(f"Signature: {'VALID' if ok else 'INVALID'}")
-        else:
-            print('Signature: could not fetch sender public key to verify.')
 
-    if it['kind'] == 'message':
-        print('\n---MESSAGE---')
-        print(plaintext.decode('utf-8', errors='replace'))
+def load_public_key(pem_bytes: bytes):
+    return serialization.load_pem_public_key(
+        pem_bytes,
+        backend=default_backend()
+    )
+
+
+def rsa_encrypt(public_pem: bytes, data: bytes) -> str:
+    """Encrypt small data (AES key) using RSA-OAEP and return base64 string."""
+    public_key = load_public_key(public_pem)
+    ciphertext = public_key.encrypt(
+        data,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    return base64.b64encode(ciphertext).decode("utf-8")
+
+
+def rsa_decrypt(private_pem: bytes, token: str) -> bytes:
+    """Decrypt base64 RSA-OAEP ciphertext using the private key."""
+    private_key = load_private_key(private_pem)
+    ciphertext = base64.b64decode(token.encode("utf-8"))
+    plaintext = private_key.decrypt(
+        ciphertext,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    return plaintext
+
+
+def aes_encrypt(plaintext: bytes):
+    """
+    Encrypt plaintext using AES-256-GCM.
+    Returns (key, nonce, tag, ciphertext) as raw bytes.
+    """
+    import os
+    key = os.urandom(32)  # AES-256 key
+    nonce = os.urandom(12)  # recommended size for GCM
+    encryptor = Cipher(
+        algorithms.AES(key),
+        modes.GCM(nonce),
+        backend=default_backend()
+    ).encryptor()
+    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+    tag = encryptor.tag
+    return key, nonce, tag, ciphertext
+
+
+def aes_decrypt(key: bytes, nonce: bytes, tag: bytes, ciphertext: bytes) -> bytes:
+    """Decrypt AES-256-GCM ciphertext."""
+    decryptor = Cipher(
+        algorithms.AES(key),
+        modes.GCM(nonce, tag),
+        backend=default_backend()
+    ).decryptor()
+    plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    return plaintext
+
+
+def sign(private_pem: bytes, data: bytes) -> str:
+    """
+    Sign data with RSA-PSS and SHA256.
+    Returns signature as base64 string.
+    """
+    private_key = load_private_key(private_pem)
+    signature = private_key.sign(
+        data,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.MAX_LENGTH
+        ),
+        hashes.SHA256()
+    )
+    return base64.b64encode(signature).decode("utf-8")
+
+
+def verify_signature(public_pem: bytes, data: bytes, signature_b64: str) -> bool:
+    """Verify RSA-PSS signature. Returns True/False."""
+    public_key = load_public_key(public_pem)
+    signature = base64.b64decode(signature_b64.encode("utf-8"))
+    try:
+        public_key.verify(
+            signature,
+            data,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return True
+    except Exception:
+        return False
+
+
+# ===== Client helpers =====
+
+KEYS_DIR = Path("keys")
+
+
+def get_key_paths(username: str):
+    KEYS_DIR.mkdir(exist_ok=True)
+    priv_path = KEYS_DIR / f"{username}_private.pem"
+    pub_path = KEYS_DIR / f"{username}_public.pem"
+    return priv_path, pub_path
+
+
+def save_keys(username: str, private_pem: bytes, public_pem: bytes):
+    priv_path, pub_path = get_key_paths(username)
+    priv_path.write_bytes(private_pem)
+    pub_path.write_bytes(public_pem)
+    print(f"Saved private key to {priv_path}")
+    print(f"Saved public key to {pub_path}")
+
+
+def load_keys(username: str) -> Tuple[bytes, bytes]:
+    priv_path, pub_path = get_key_paths(username)
+    if not priv_path.exists() or not pub_path.exists():
+        raise RuntimeError(f"Keys for user '{username}' do not exist. Run 'register' first.")
+    return priv_path.read_bytes(), pub_path.read_bytes()
+
+
+def fetch_public_key(base_url: str, username: str) -> bytes:
+    resp = requests.get(f"{base_url}/users/{username}/public_key", timeout=5)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Could not fetch public key for '{username}': {resp.text}")
+    data = resp.json()
+    return data["public_key"].encode("utf-8")
+
+
+# ===== Commands =====
+
+def cmd_register(args):
+    base_url = args.server.rstrip("/")
+    username = args.username
+    private_pem, public_pem = generate_rsa_keypair()
+
+    # send public key to server
+    resp = requests.post(
+        f"{base_url}/register",
+        json={"username": username, "public_key": public_pem.decode("utf-8")},
+        timeout=5
+    )
+    if resp.status_code != 200:
+        print("Error from server:", resp.text)
+        return
+
+    save_keys(username, private_pem, public_pem)
+    print("Registered successfully on server.")
+
+
+def cmd_send_message(args):
+    base_url = args.server.rstrip("/")
+    sender = args.sender
+    recipient = args.recipient
+    text = args.text
+
+    private_pem, _ = load_keys(sender)
+    recipient_pub = fetch_public_key(base_url, recipient)
+
+    plaintext_bytes = text.encode("utf-8")
+    key, nonce, tag, ciphertext = aes_encrypt(plaintext_bytes)
+
+    encrypted_key = rsa_encrypt(recipient_pub, key)
+
+    payload = {
+        "from": sender,
+        "to": recipient,
+        "encrypted_key": encrypted_key,
+        "nonce": base64.b64encode(nonce).decode("utf-8"),
+        "tag": base64.b64encode(tag).decode("utf-8"),
+        "ciphertext": base64.b64encode(ciphertext).decode("utf-8"),
+        "is_file": False,
+        "filename": None,
+    }
+
+    # Optional digital signature (sign ciphertext)
+    if args.sign:
+        signature = sign(private_pem, ciphertext)
+        payload["signature"] = signature
+
+    resp = requests.post(f"{base_url}/send", json=payload, timeout=10)
+    if resp.status_code != 200:
+        print("Error from server:", resp.text)
     else:
-        out = Path(args.out or (Path.cwd() / (it.get('filename') or f"file_{args.id}.bin")))
-        out.write_bytes(plaintext)
-        print(f"File decrypted -> {out}")
+        print("Message sent successfully. ID:", resp.json().get("id"))
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description='SecureTalk Client (prototype)')
-    p.add_argument('--server', default=DEFAULT_SERVER)
+def cmd_send_file(args):
+    base_url = args.server.rstrip("/")
+    sender = args.sender
+    recipient = args.recipient
+    file_path = Path(args.file)
 
-    sub = p.add_subparsers(dest='cmd', required=True)
+    if not file_path.exists():
+        print(f"File not found: {file_path}")
+        return
 
-    s = sub.add_parser('register', help='Register a new user and upload public key')
-    s.add_argument('username')
-    s.set_defaults(func=cmd_register)
+    private_pem, _ = load_keys(sender)
+    recipient_pub = fetch_public_key(base_url, recipient)
 
-    s = sub.add_parser('login', help='Login to get token')
-    s.add_argument('username')
-    s.set_defaults(func=cmd_login)
+    file_bytes = file_path.read_bytes()
+    key, nonce, tag, ciphertext = aes_encrypt(file_bytes)
+    encrypted_key = rsa_encrypt(recipient_pub, key)
 
-    s = sub.add_parser('send', help='Send an encrypted message or file')
-    s.add_argument('sender', help='your username')
-    s.add_argument('--to', required=True, help='recipient username')
-    g = s.add_mutually_exclusive_group(required=True)
-    g.add_argument('--message', help='message text')
-    g.add_argument('--file', help='file path to send')
-    s.add_argument('--sign', action='store_true', help='attach digital signature (optional)')
-    s.set_defaults(func=cmd_send)
+    payload = {
+        "from": sender,
+        "to": recipient,
+        "encrypted_key": encrypted_key,
+        "nonce": base64.b64encode(nonce).decode("utf-8"),
+        "tag": base64.b64encode(tag).decode("utf-8"),
+        "ciphertext": base64.b64encode(ciphertext).decode("utf-8"),
+        "is_file": True,
+        "filename": file_path.name,
+    }
 
-    s = sub.add_parser('inbox', help='List inbox')
-    s.add_argument('username')
-    s.set_defaults(func=cmd_inbox)
+    if args.sign:
+        signature = sign(private_pem, ciphertext)
+        payload["signature"] = signature
 
-    s = sub.add_parser('read', help='Decrypt and display/save an inbox item')
-    s.add_argument('username')
-    s.add_argument('id', type=int)
-    s.add_argument('--out', help='output path for files')
-    s.set_defaults(func=cmd_read)
-
-    return p
+    resp = requests.post(f"{base_url}/send", json=payload, timeout=20)
+    if resp.status_code != 200:
+        print("Error from server:", resp.text)
+    else:
+        print("File sent successfully. ID:", resp.json().get("id"))
 
 
-def main() -> None:
-    parser = build_parser()
+def cmd_inbox(args):
+    base_url = args.server.rstrip("/")
+    username = args.username
+    private_pem, _ = load_keys(username)
+
+    resp = requests.get(f"{base_url}/inbox/{username}", timeout=10)
+    if resp.status_code != 200:
+        print("Error from server:", resp.text)
+        return
+
+    data = resp.json()
+    messages = data.get("messages", [])
+    if not messages:
+        print("Inbox is empty.")
+        return
+
+    print(f"Inbox for {username}:")
+    for msg in messages:
+        print("=" * 40)
+        print(f"ID: {msg['id']}")
+        print(f"From: {msg['from']}")
+        print(f"To: {msg['to']}")
+        print(f"Created at: {msg.get('created_at')}")
+        is_file = msg.get("is_file", False)
+        filename = msg.get("filename")
+
+        # 1) Decrypt AES key with recipient's private key
+        key_bytes = rsa_decrypt(private_pem, msg["encrypted_key"])
+
+        # 2) Decrypt content with AES
+        nonce = base64.b64decode(msg["nonce"].encode("utf-8"))
+        tag = base64.b64decode(msg["tag"].encode("utf-8"))
+        ciphertext = base64.b64decode(msg["ciphertext"].encode("utf-8"))
+
+        try:
+            plaintext = aes_decrypt(key_bytes, nonce, tag, ciphertext)
+        except Exception as e:
+            print("!! Failed to decrypt message:", e)
+            continue
+
+        # 3) Verify optional signature using sender's public key
+        signature = msg.get("signature")
+        if signature:
+            try:
+                sender_pub = fetch_public_key(base_url, msg["from"])
+                ok = verify_signature(sender_pub, ciphertext, signature)
+            except Exception as e:
+                ok = False
+                print("!! Failed to verify signature:", e)
+            print(f"Signature valid: {ok}")
+
+        # 4) Show or save decrypted content
+        if is_file:
+            out_dir = Path(args.output or ".")
+            out_dir.mkdir(exist_ok=True)
+            out_path = out_dir / (filename or f"{msg['id']}.bin")
+            out_path.write_bytes(plaintext)
+            print(f"[FILE] Saved decrypted file to: {out_path}")
+        else:
+            print("Message text:")
+            print(plaintext.decode("utf-8", errors="replace"))
+
+
+def cmd_list_users(args):
+    base_url = args.server.rstrip("/")
+    resp = requests.get(f"{base_url}/users", timeout=5)
+    if resp.status_code != 200:
+        print("Error from server:", resp.text)
+        return
+    users = resp.json().get("users", [])
+    print("Users on server:")
+    for u in users:
+        print("-", u)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SecureTalk client")
+    parser.add_argument(
+        "--server",
+        default="http://127.0.0.1:5000",
+        help="Base URL of SecureTalk server (default: %(default)s)",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # register
+    p_reg = subparsers.add_parser("register", help="Register a new user")
+    p_reg.add_argument("username")
+    p_reg.set_defaults(func=cmd_register)
+
+    # send-message
+    p_send = subparsers.add_parser("send-message", help="Send encrypted message")
+    p_send.add_argument("sender")
+    p_send.add_argument("recipient")
+    p_send.add_argument("text", help="Message text")
+    p_send.add_argument("--sign", action="store_true", help="Digitally sign the message")
+    p_send.set_defaults(func=cmd_send_message)
+
+    # send-file
+    p_file = subparsers.add_parser("send-file", help="Send encrypted file")
+    p_file.add_argument("sender")
+    p_file.add_argument("recipient")
+    p_file.add_argument("file")
+    p_file.add_argument("--sign", action="store_true", help="Digitally sign the file")
+    p_file.set_defaults(func=cmd_send_file)
+
+    # inbox
+    p_inbox = subparsers.add_parser("inbox", help="Read and decrypt inbox")
+    p_inbox.add_argument("username")
+    p_inbox.add_argument("--output", help="Directory to save decrypted files")
+    p_inbox.set_defaults(func=cmd_inbox)
+
+    # list-users
+    p_list = subparsers.add_parser("list-users", help="List users on server")
+    p_list.set_defaults(func=cmd_list_users)
+
     args = parser.parse_args()
     args.func(args)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
