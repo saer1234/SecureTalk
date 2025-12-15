@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>SecureTalk – Web Frontend</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #f5f5f7;
+    }
+    h1 {
+      margin-top: 0;
+    }
+    .card {
+      background: #ffffff;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    label {
+      display: block;
+      font-size: 0.9rem;
+      margin-bottom: 4px;
+    }
+    input[type="text"],
+    textarea {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 6px 8px;
+      margin-bottom: 8px;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+      font-family: inherit;
+      font-size: 0.95rem;
+    }
+    textarea {
+      min-height: 80px;
+    }
+    input[type="file"] {
+      margin-bottom: 8px;
+    }
+    button {
+      padding: 6px 12px;
+      border-radius: 4px;
+      border: none;
+      cursor: pointer;
+      font-size: 0.9rem;
+      margin-right: 6px;
+      background: #2563eb;
+      color: white;
+    }
+    button.secondary {
+      background: #6b7280;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    #status {
+      margin-top: 8px;
+      font-size: 0.9rem;
+    }
+    #users-list {
+      padding-left: 18px;
+      margin-top: 4px;
+    }
+    .message {
+      border-top: 1px solid #e5e7eb;
+      padding-top: 8px;
+      margin-top: 8px;
+    }
+    .message-header {
+      font-size: 0.85rem;
+      color: #6b7280;
+      margin-bottom: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>SecureTalk – Web Frontend (Hybrid Cryptography)</h1>
+
+  <div class="card">
+    <h2>1. Register user (generates RSA keys in browser)</h2>
+    <label for="reg-username">New username</label>
+    <input id="reg-username" type="text" placeholder="e.g. alice" />
+    <button id="btn-register">Register</button>
+    <p style="font-size: 0.8rem; color:#6b7280;">
+      Private key is stored only in this browser (localStorage). Server receives only your public key.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>2. Current user & users on server</h2>
+    <label for="current-username">Current username (must be registered in this browser)</label>
+    <input id="current-username" type="text" placeholder="e.g. alice" />
+
+    <button id="btn-list-users" class="secondary">List users on server</button>
+    <ul id="users-list"></ul>
+  </div>
+
+  <div class="card">
+    <h2>3. Send encrypted message</h2>
+    <label for="recipient">Recipient username</label>
+    <input id="recipient" type="text" placeholder="e.g. bob" />
+
+    <label for="message">Message text</label>
+    <textarea id="message" placeholder="Write your secret message here..."></textarea>
+
+    <button id="btn-send">Encrypt &amp; Send</button>
+  </div>
+
+  <div class="card">
+    <h2>3b. Send encrypted file</h2>
+    <label for="file-recipient">Recipient username</label>
+    <input id="file-recipient" type="text" placeholder="e.g. bob" />
+
+    <label for="file-input">Choose file</label>
+    <input id="file-input" type="file" />
+
+    <button id="btn-send-file">Encrypt &amp; Send File</button>
+    <p style="font-size: 0.8rem; color:#6b7280;">
+      File is encrypted in your browser with AES-GCM, and the AES key is encrypted with the recipient's RSA public key.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>4. Inbox (decrypt messages &amp; files for current user)</h2>
+    <button id="btn-inbox" class="secondary">Load &amp; decrypt inbox</button>
+    <div id="inbox-messages"></div>
+  </div>
+
+  <div id="status"></div>
+
+  <script>
+    "use strict";
+
+    const textEncoder = new TextEncoder();
+    const textDecoder = new TextDecoder();
+
+    function setStatus(msg, isError) {
+      const el = document.getElementById("status");
+      if (!el) return;
+      el.textContent = msg;
+      el.style.color = isError ? "red" : "green";
+    }
+
+    // ---- Base64 & PEM helpers ----
+
+    function arrayBufferToBase64(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = "";
+      for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      return btoa(binary);
+    }
+
+    function base64ToArrayBuffer(base64) {
+      const binary = atob(base64);
+      const len = binary.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes.buffer;
+    }
+
+    function pemToArrayBuffer(pem) {
+      const lines = pem.trim().split("\n");
+      const base64Lines = [];
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (line.length === 0) continue;
+        if (line.startsWith("-----")) continue;
+        base64Lines.push(line);
+      }
+      const base64 = base64Lines.join("");
+      return base64ToArrayBuffer(base64);
+    }
+
+    function arrayBufferToPem(buffer, label) {
+      const base64 = arrayBufferToBase64(buffer);
+      const lines = [];
+      for (let i = 0; i < base64.length; i += 64) {
+        lines.push(base64.slice(i, i + 64));
+      }
+      return "-----BEGIN " + label + "-----\n" +
+             lines.join("\n") +
+             "\n-----END " + label + "-----";
+    }
+
+    async function exportPublicKeyToPem(publicKey) {
+      const spki = await window.crypto.subtle.exportKey("spki", publicKey);
+      return arrayBufferToPem(spki, "PUBLIC KEY");
+    }
+
+    async function exportPrivateKeyToPem(privateKey) {
+      const pkcs8 = await window.crypto.subtle.exportKey("pkcs8", privateKey);
+      return arrayBufferToPem(pkcs8, "PRIVATE KEY");
+    }
+
+    async function importPublicKeyForEncrypt(pem) {
+      const der = pemToArrayBuffer(pem);
+      return window.crypto.subtle.importKey(
+        "spki",
+        der,
+        { name: "RSA-OAEP", hash: "SHA-256" },
+        true,
+        ["encrypt"]
+      );
+    }
+
+    async function importPrivateKeyForDecrypt(pem) {
+      const der = pemToArrayBuffer(pem);
+      return window.crypto.subtle.importKey(
+        "pkcs8",
+        der,
+        { name: "RSA-OAEP", hash: "SHA-256" },
+        false,
+        ["decrypt"]
+      );
+    }
+
+    function savePrivateKeyPem(username, pem) {
+      localStorage.setItem("securetalk_private_" + username, pem);
+    }
+
+    function loadPrivateKeyPem(username) {
+      return localStorage.getItem("securetalk_private_" + username);
+    }
+
+    // ---- RSA keypair ----
+
+    async function generateRsaKeyPair() {
+      return window.crypto.subtle.generateKey(
+        {
+          name: "RSA-OAEP",
+          modulusLength: 2048,
+          publicExponent: new Uint8Array([1, 0, 1]),
+          hash: "SHA-256"
+        },
+        true,
+        ["encrypt", "decrypt"]
+      );
+    }
+
+    // ---- AES-GCM helpers ----
+
+    async function generateAesKey() {
+      return window.crypto.subtle.generateKey(
+        { name: "AES-GCM", length: 256 },
+        true,
+        ["encrypt", "decrypt"]
+      );
+    }
+
+    async function exportAesKeyRaw(aesKey) {
+      const raw = await window.crypto.subtle.exportKey("raw", aesKey);
+      return new Uint8Array(raw);
+    }
+
+    async function importAesKeyRaw(rawBytes) {
+      return window.crypto.subtle.importKey(
+        "raw",
+        rawBytes,
+        { name: "AES-GCM" },
+        false,
+        ["decrypt"]
+      );
+    }
+
+    async function encryptWithAesGcm(aesKey, plaintextBytes) {
+      const iv = window.crypto.getRandomValues(new Uint8Array(12)); // 96-bit nonce
+      const encrypted = await window.crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: iv },
+        aesKey,
+        plaintextBytes
+      );
+      const encryptedBytes = new Uint8Array(encrypted);
+      const tagLength = 16; // 128-bit tag
+      if (encryptedBytes.length < tagLength) {
+        throw new Error("Ciphertext too short");
+      }
+      const ciphertext = encryptedBytes.slice(0, encryptedBytes.length - tagLength);
+      const tag = encryptedBytes.slice(encryptedBytes.length - tagLength);
+      return { iv: iv, ciphertext: ciphertext, tag: tag };
+    }
+
+    async function decryptWithAesGcm(aesKey, iv, ciphertext, tag) {
+      const full = new Uint8Array(ciphertext.length + tag.length);
+      full.set(ciphertext, 0);
+      full.set(tag, ciphertext.length);
+      const decrypted = await window.crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: iv },
+        aesKey,
+        full
+      );
+      return new Uint8Array(decrypted);
+    }
+
+    // ---- UI helpers ----
+
+    function getCurrentUsername() {
+      const input = document.getElementById("current-username");
+      if (!input) return "";
+      return input.value.trim();
+    }
+
+    // ---- Actions ----
+
+    async function registerUser() {
+      const usernameInput = document.getElementById("reg-username");
+      if (!usernameInput) return;
+      const username = usernameInput.value.trim();
+      if (!username) {
+        setStatus("Please enter a username.", true);
+        return;
+      }
+
+      try {
+        setStatus("Generating RSA key pair...", false);
+        const keyPair = await generateRsaKeyPair();
+        const publicPem = await exportPublicKeyToPem(keyPair.publicKey);
+        const privatePem = await exportPrivateKeyToPem(keyPair.privateKey);
+
+        const resp = await fetch("/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: username, public_key: publicPem })
+        });
+
+        if (!resp.ok) {
+          const text = await resp.text();
+          setStatus("Register failed: " + text, true);
+          return;
+        }
+
+        savePrivateKeyPem(username, privatePem);
+        setStatus("Registered user '" + username + "' successfully.", false);
+
+        const currentUserInput = document.getElementById("current-username");
+        if (currentUserInput) {
+          currentUserInput.value = username;
+        }
+      } catch (err) {
+        console.error(err);
+        setStatus("Error during registration: " + err.message, true);
+      }
+    }
+
+    async function listUsers() {
+      try {
+        const resp = await fetch("/users");
+        if (!resp.ok) {
+          const text = await resp.text();
+          setStatus("Error fetching users: " + text, true);
+          return;
+        }
+        const data = await resp.json();
+        const users = data.users || [];
+        const listEl = document.getElementById("users-list");
+        if (!listEl) return;
+        listEl.innerHTML = "";
+        for (let i = 0; i < users.length; i++) {
+          const li = document.createElement("li");
+          li.textContent = users[i];
+          listEl.appendChild(li);
+        }
+        setStatus("Loaded " + users.length + " users.", false);
+      } catch (err) {
+        console.error(err);
+        setStatus("Error fetching users: " + err.message, true);
+      }
+    }
+
+    async function sendMessage() {
+      const sender = getCurrentUsername();
+      const recipientInput = document.getElementById("recipient");
+      const messageInput = document.getElementById("message");
+      if (!recipientInput || !messageInput) return;
+
+      const recipient = recipientInput.value.trim();
+      const text = messageInput.value;
+
+      if (!sender) {
+        setStatus("Set current username first (must be registered in this browser).", true);
+        return;
+      }
+      if (!recipient) {
+        setStatus("Enter recipient username.", true);
+        return;
+      }
+      if (!text) {
+        setStatus("Enter message text.", true);
+        return;
+      }
+
+      const privatePem = loadPrivateKeyPem(sender);
+      if (!privatePem) {
+        setStatus("No local private key for '" + sender + "'. Register this user in this browser first.", true);
+        return;
+      }
+
+      try {
+        setStatus("Encrypting & sending message...", false);
+
+        // Fetch recipient public key from server
+        const resp = await fetch("/users/" + encodeURIComponent(recipient) + "/public_key");
+        if (!resp.ok) {
+          const txt = await resp.text();
+          setStatus("Error fetching recipient key: " + txt, true);
+          return;
+        }
+        const data = await resp.json();
+        const recipientPem = data.public_key;
+
+        const recipientKey = await importPublicKeyForEncrypt(recipientPem);
+
+        // AES encrypt
+        const aesKey = await generateAesKey();
+        const plaintextBytes = textEncoder.encode(text);
+        const encResult = await encryptWithAesGcm(aesKey, plaintextBytes);
+
+        // Export AES key raw & RSA-encrypt with recipient's key
+        const aesRaw = await exportAesKeyRaw(aesKey);
+        const encryptedAesKey = await window.crypto.subtle.encrypt(
+          { name: "RSA-OAEP" },
+          recipientKey,
+          aesRaw
+        );
+
+        const payload = {
+          from: sender,
+          to: recipient,
+          encrypted_key: arrayBufferToBase64(encryptedAesKey),
+          nonce: arrayBufferToBase64(encResult.iv.buffer),
+          tag: arrayBufferToBase64(encResult.tag.buffer),
+          ciphertext: arrayBufferToBase64(encResult.ciphertext.buffer),
+          is_file: false,
+          filename: null
+          // signature omitted in web frontend for simplicity
+        };
+
+        const sendResp = await fetch("/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        if (!sendResp.ok) {
+          const tx = await sendResp.text();
+          setStatus("Error sending message: " + tx, true);
+          return;
+        }
+
+        const sendData = await sendResp.json();
+        setStatus("Message sent. ID: " + sendData.id, false);
+        messageInput.value = "";
+      } catch (err) {
+        console.error(err);
+        setStatus("Error sending message: " + err.message, true);
+      }
+    }
+
+    async function sendFile() {
+      const sender = getCurrentUsername();
+      const recipientInput = document.getElementById("file-recipient");
+      const fileInput = document.getElementById("file-input");
+      if (!recipientInput || !fileInput) return;
+
+      const recipient = recipientInput.value.trim();
+      const files = fileInput.files;
+
+      if (!sender) {
+        setStatus("Set current username first (must be registered in this browser).", true);
+        return;
+      }
+      if (!recipient) {
+        setStatus("Enter recipient username for file.", true);
+        return;
+      }
+      if (!files || files.length === 0) {
+        setStatus("Choose a file to send.", true);
+        return;
+      }
+
+      const file = files[0];
+      const privatePem = loadPrivateKeyPem(sender);
+      if (!privatePem) {
+        setStatus("No local private key for '" + sender + "'. Register this user in this browser first.", true);
+        return;
+      }
+
+      try {
+        setStatus("Encrypting & sending file...", false);
+
+        // Fetch recipient public key from server
+        const resp = await fetch("/users/" + encodeURIComponent(recipient) + "/public_key");
+        if (!resp.ok) {
+          const txt = await resp.text();
+          setStatus("Error fetching recipient key: " + txt, true);
+          return;
+        }
+        const data = await resp.json();
+        const recipientPem = data.public_key;
+        const recipientKey = await importPublicKeyForEncrypt(recipientPem);
+
+        // Read file bytes
+        const fileBuffer = await file.arrayBuffer();
+        const fileBytes = new Uint8Array(fileBuffer);
+
+        // AES encrypt file
+        const aesKey = await generateAesKey();
+        const encResult = await encryptWithAesGcm(aesKey, fileBytes);
+
+        // Export AES key raw & RSA-encrypt with recipient's key
+        const aesRaw = await exportAesKeyRaw(aesKey);
+        const encryptedAesKey = await window.crypto.subtle.encrypt(
+          { name: "RSA-OAEP" },
+          recipientKey,
+          aesRaw
+        );
+
+        const payload = {
+          from: sender,
+          to: recipient,
+          encrypted_key: arrayBufferToBase64(encryptedAesKey),
+          nonce: arrayBufferToBase64(encResult.iv.buffer),
+          tag: arrayBufferToBase64(encResult.tag.buffer),
+          ciphertext: arrayBufferToBase64(encResult.ciphertext.buffer),
+          is_file: true,
+          filename: file.name
+          // signature omitted in web frontend for simplicity
+        };
+
+        const sendResp = await fetch("/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        if (!sendResp.ok) {
+          const tx = await sendResp.text();
+          setStatus("Error sending file: " + tx, true);
+          return;
+        }
+
+        const sendData = await sendResp.json();
+        setStatus("File sent. ID: " + sendData.id, false);
+        fileInput.value = "";
+      } catch (err) {
+        console.error(err);
+        setStatus("Error sending file: " + err.message, true);
+      }
+    }
+
+    async function loadInbox() {
+      const username = getCurrentUsername();
+      if (!username) {
+        setStatus("Set current username first.", true);
+        return;
+      }
+      const privatePem = loadPrivateKeyPem(username);
+      if (!privatePem) {
+        setStatus("No local private key for '" + username + "'. Register this user in this browser first.", true);
+        return;
+      }
+
+      try {
+        setStatus("Loading inbox...", false);
+        const resp = await fetch("/inbox/" + encodeURIComponent(username));
+        if (!resp.ok) {
+          const tx = await resp.text();
+          setStatus("Error loading inbox: " + tx, true);
+          return;
+        }
+        const data = await resp.json();
+        const messages = data.messages || [];
+        const container = document.getElementById("inbox-messages");
+        if (!container) return;
+        container.innerHTML = "";
+
+        if (messages.length === 0) {
+          const p = document.createElement("p");
+          p.textContent = "Inbox is empty.";
+          container.appendChild(p);
+          setStatus("Inbox is empty.", false);
+          return;
+        }
+
+        const privateKey = await importPrivateKeyForDecrypt(privatePem);
+
+        for (let i = 0; i < messages.length; i++) {
+          const msg = messages[i];
+          const div = document.createElement("div");
+          div.className = "message";
+
+          const header = document.createElement("div");
+          header.className = "message-header";
+          header.textContent = "From: " + msg.from + " | ID: " + msg.id + " | " + (msg.created_at || "");
+          div.appendChild(header);
+
+          try {
+            const encryptedKeyBuf = base64ToArrayBuffer(msg.encrypted_key);
+            const decryptedKeyRaw = await window.crypto.subtle.decrypt(
+              { name: "RSA-OAEP" },
+              privateKey,
+              encryptedKeyBuf
+            );
+            const aesKey = await importAesKeyRaw(new Uint8Array(decryptedKeyRaw));
+
+            const ivBytes = new Uint8Array(base64ToArrayBuffer(msg.nonce));
+            const tagBytes = new Uint8Array(base64ToArrayBuffer(msg.tag));
+            const ctBytes = new Uint8Array(base64ToArrayBuffer(msg.ciphertext));
+
+            const plaintextBytes = await decryptWithAesGcm(
+              aesKey,
+              ivBytes,
+              ctBytes,
+              tagBytes
+            );
+
+            if (msg.is_file) {
+              const filename = msg.filename || ("file_" + msg.id);
+              const blob = new Blob([plaintextBytes], { type: "application/octet-stream" });
+              const url = URL.createObjectURL(blob);
+              const link = document.createElement("a");
+              link.href = url;
+              link.download = filename;
+              link.textContent = "Download " + filename;
+              const p = document.createElement("p");
+              p.appendChild(link);
+              div.appendChild(p);
+            } else {
+              const text = textDecoder.decode(plaintextBytes);
+              const p = document.createElement("p");
+              p.textContent = text;
+              div.appendChild(p);
+            }
+          } catch (err) {
+            console.error("Error decrypting message", err);
+            const p = document.createElement("p");
+            p.textContent = "Error decrypting this message: " + err.message;
+            div.appendChild(p);
+          }
+
+          container.appendChild(div);
+        }
+
+        setStatus("Loaded " + messages.length + " messages.", false);
+      } catch (err) {
+        console.error(err);
+        setStatus("Error loading inbox: " + err.message, true);
+      }
+    }
+
+    // ---- Wire up buttons ----
+
+    window.addEventListener("DOMContentLoaded", function () {
+      const btnRegister = document.getElementById("btn-register");
+      const btnListUsers = document.getElementById("btn-list-users");
+      const btnSend = document.getElementById("btn-send");
+      const btnSendFile = document.getElementById("btn-send-file");
+      const btnInbox = document.getElementById("btn-inbox");
+
+      if (btnRegister) {
+        btnRegister.addEventListener("click", function () {
+          registerUser();
+        });
+      }
+      if (btnListUsers) {
+        btnListUsers.addEventListener("click", function () {
+          listUsers();
+        });
+      }
+      if (btnSend) {
+        btnSend.addEventListener("click", function () {
+          sendMessage();
+        });
+      }
+      if (btnSendFile) {
+        btnSendFile.addEventListener("click", function () {
+          sendFile();
+        });
+      }
+      if (btnInbox) {
+        btnInbox.addEventListener("click", function () {
+          loadInbox();
+        });
+      }
+    });
+  </script>
+</body>
+</html>
