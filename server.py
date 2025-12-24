@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, render_template
+from flask_cors import CORS
 import json
 import os
 from uuid import uuid4
@@ -8,6 +9,7 @@ from threading import Lock
 DATA_FILE = "server_data.json"
 
 app = Flask(__name__)
+CORS(app)
 _data_lock = Lock()
 
 
@@ -26,7 +28,7 @@ def save_data(data):
     """Save server data to JSON file."""
     with _data_lock:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f,indent=2)
 
 
 @app.route("/")
@@ -144,4 +146,4 @@ def inbox(username):
 
 if __name__ == "__main__":
     # For development/evaluation
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)

@@ -136,7 +136,7 @@
 
   <script>
     "use strict";
-
+    const ips="http://192.168.1.105:5000";
     const textEncoder = new TextEncoder();
     const textDecoder = new TextDecoder();
 
@@ -237,13 +237,14 @@
     async function generateRsaKeyPair() {
       return window.crypto.subtle.generateKey(
         {
-          name: "RSA-OAEP",
-          modulusLength: 2048,
-          publicExponent: new Uint8Array([1, 0, 1]),
-          hash: "SHA-256"
+          name: "RSA-OAEP", //Optimal Asymmetric Encryption Padding
+          modulusLength: 2048, //2048 bits
+          publicExponent: new Uint8Array([1, 0, 1]), //The array [1, 0, 1] represents the number 65537 in bytes.
+          hash: "SHA-256" //This tells the OAEP padding scheme to use SHA-256 to randomize the data during encryption, adding an extra layer of security.
         },
-        true,
-        ["encrypt", "decrypt"]
+        true,//Means you are allowed to export these keys later
+        ["encrypt", "decrypt"] //The Public Key will be allowed to encrypt.
+                              //The Private Key will be allowed to decrypt.
       );
     }
 
@@ -326,7 +327,7 @@
         const publicPem = await exportPublicKeyToPem(keyPair.publicKey);
         const privatePem = await exportPrivateKeyToPem(keyPair.privateKey);
 
-        const resp = await fetch("/register", {
+        const resp = await fetch(ips+"/register", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ username: username, public_key: publicPem })
@@ -353,7 +354,7 @@
 
     async function listUsers() {
       try {
-        const resp = await fetch("/users");
+        const resp = await fetch(ips+"/users");
         if (!resp.ok) {
           const text = await resp.text();
           setStatus("Error fetching users: " + text, true);
@@ -408,7 +409,7 @@
         setStatus("Encrypting & sending message...", false);
 
         // Fetch recipient public key from server
-        const resp = await fetch("/users/" + encodeURIComponent(recipient) + "/public_key");
+        const resp = await fetch(ips+"/users/" + encodeURIComponent(recipient) + "/public_key");
         if (!resp.ok) {
           const txt = await resp.text();
           setStatus("Error fetching recipient key: " + txt, true);
@@ -444,7 +445,7 @@
           // signature omitted in web frontend for simplicity
         };
 
-        const sendResp = await fetch("/send", {
+        const sendResp = await fetch(ips+"/send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
@@ -498,7 +499,7 @@
         setStatus("Encrypting & sending file...", false);
 
         // Fetch recipient public key from server
-        const resp = await fetch("/users/" + encodeURIComponent(recipient) + "/public_key");
+        const resp = await fetch(ips+"/users/" + encodeURIComponent(recipient) + "/public_key");
         if (!resp.ok) {
           const txt = await resp.text();
           setStatus("Error fetching recipient key: " + txt, true);
@@ -511,7 +512,6 @@
         // Read file bytes
         const fileBuffer = await file.arrayBuffer();
         const fileBytes = new Uint8Array(fileBuffer);
-
         // AES encrypt file
         const aesKey = await generateAesKey();
         const encResult = await encryptWithAesGcm(aesKey, fileBytes);
@@ -536,7 +536,7 @@
           // signature omitted in web frontend for simplicity
         };
 
-        const sendResp = await fetch("/send", {
+        const sendResp = await fetch(ips+"/send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
